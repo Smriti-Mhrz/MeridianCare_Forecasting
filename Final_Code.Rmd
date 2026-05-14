@@ -1,0 +1,362 @@
+
+library(fpp3)
+install.packages("patchwork")
+library(patchwork)
+
+
+# ── Step 1: Load Data & Create Tsibble ──────────────────────────────────────
+meridian <- read.csv("MeridianCare_Visits.csv") |>
+  mutate(Month = yearmonth(my(Month))) |>
+  as_tsibble(index = Month)
+
+glimpse(meridian)
+meridian |> as_tibble() |> mutate(Month = as.character(Month)) |> summary()
+
+
+
+# ── Step 2: Train / Holdout Split ────────────────────────────────────────────
+# Training: Jan 2015 – Dec 2023  (108 months)
+# Holdout:  Jan 2024 – Dec 2024  (12 months)
+
+train   <- meridian |> filter(year(Month) <= 2023)
+holdout <- meridian |> filter(year(Month) == 2024)
+
+cat("Training:", nrow(train), "obs | Holdout:", nrow(holdout), "obs\n")
+
+
+# Q1 — Time Plot with Holiday Distinction (5 pts)
+
+
+# Create a factor column for point shape/color
+meridian_plot <- meridian |>
+  mutate(HolidayLabel = if_else(HolidayWeek == 1, "Holiday Month", "Non-Holiday Month"))
+
+ggplot(meridian_plot, aes(x = Month, y = Visits)) +
+  # Non-holiday months — thin grey line connecting all points
+  geom_line(colour = "grey60", linewidth = 0.5) +
+  # All points, shaped/coloured by holiday status
+  geom_point(aes(colour = HolidayLabel, shape = HolidayLabel, size = HolidayLabel)) +
+  scale_colour_manual(values = c("Holiday Month" = "#D62728",
+                                 "Non-Holiday Month" = "grey50")) +
+  scale_shape_manual(values  = c("Holiday Month" = 17,    # filled triangle
+                                 "Non-Holiday Month" = 1)) + # open circle
+  scale_size_manual(values   = c("Holiday Month" = 3.5,
+                                 "Non-Holiday Month" = 1.5)) +
+  geom_smooth(method = "lm", se = FALSE, colour = "#1F77B4",
+              linetype = "dashed", linewidth = 0.8) +
+  labs(
+    title    = "MeridianCare: Monthly Patient Visits, 2015–2024",
+    subtitle = "Red filled triangles = holiday months (Jul 4, Thanksgiving, Christmas/New Year)",
+    x        = "Month",
+    y        = "Visits (thousands)",
+    colour   = NULL, shape = NULL, size = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        plot.title = element_text(face = "bold"))
+
+# Q2 — Correlation Matrix (4 pts)
+
+# ── Step 4: Correlation matrix — training data only ──────────────────────────
+cor_matrix <- train |>
+  as_tibble() |>
+  select(Visits, StaffHours, Outreach, FluIndex) |>
+  cor() |>
+  round(3)
+
+print(cor_matrix)
+
+# Extract the three correlations of interest
+r_staff    <- cor_matrix["Visits", "StaffHours"]
+r_outreach <- cor_matrix["Visits", "Outreach"]
+r_flu      <- cor_matrix["Visits", "FluIndex"]
+
+knitr::kable(
+  data.frame(
+    Regressor  = c("StaffHours", "Outreach", "FluIndex"),
+    r_Visits   = c(r_staff, r_outreach, r_flu)
+  ),
+  col.names = c("Regressor", "Pearson r with Visits"),
+  digits    = 3,
+  caption   = "Table Q2: Pearson correlations with monthly Visits (training data, n = 108)"
+)
+
+
+
+# Q3 — Pure ARIMA Model (5 pts)
+
+
+# ── Pure ARIMA — no external regressors; auto-select order ──────────────────
+fit_arima <- train |>
+  model(ARIMA_pure = ARIMA(Visits))
+
+report(fit_arima)
+
+
+
+# Forecast the 12 holdout months
+fc_arima <- fit_arima |> forecast(h = 12)
+
+# Holdout accuracy
+acc_arima <- accuracy(fc_arima, meridian) |>
+  select(.model, RMSE, MAE, MASE, ME)
+
+print(acc_arima)
+
+
+
+glance(fit_arima) |> select(.model, AICc)
+
+# Q4 — MASE Interpretation (4 pts)
+
+mase_val <- acc_arima |> pull(MASE) |> round(4)
+cat("Pure ARIMA holdout MASE:", mase_val, "\n")
+
+# ── Step 5: Fit three dynamic regression models ──────────────────────────────
+fit_dr <- train |>
+  model(
+    M1 = ARIMA(Visits ~ trend() + season() + StaffHours + Outreach + HolidayWeek),
+    M2 = ARIMA(Visits ~ trend() + season() + FluIndex + StaffHours + Outreach + HolidayWeek),
+    M3 = ARIMA(Visits ~ trend() + season() + FluIndex)
+  )
+
+fit_dr |> select(M1) |> report()
+fit_dr |> select(M2) |> report()
+fit_dr |> select(M3) |> report()
+
+aicc_table <- glance(fit_dr) |>
+  select(.model, AICc) |>
+  arrange(AICc)
+
+print(aicc_table)
+
+winner      <- aicc_table$.model[1]
+winner_aicc <- aicc_table$AICc[1]
+runner_aicc <- aicc_table$AICc[2]
+margin      <- runner_aicc - winner_aicc
+
+cat("\nWinner:", winner, "  AICc:", round(winner_aicc, 2))
+cat("\n2nd best:", aicc_table$.model[2], "  AICc:", round(runner_aicc, 2))
+cat("\nMargin:", round(margin, 2), "AICc units\n")
+
+# Q6 — Model Deployment Decision (8 pts)
+
+
+# Data dictionary reminder:
+# FluIndex:   CDC regional index, published ~3 weeks AFTER each month closes
+# StaffHours: Budgeted 2 months in advance
+# Outreach:   Set 6 weeks in advance
+# HolidayWeek: Calendar-determined, known years in advance
+
+cat("=== Regressor Availability for Q1 2025 Forecast (produced mid-January 2025) ===\n\n")
+cat("Jan 2025 FluIndex : UNAVAILABLE — month not yet closed; CDC publishes ~3 wks after close\n")
+cat("Feb 2025 FluIndex : UNAVAILABLE — month has not begun\n")
+cat("Mar 2025 FluIndex : UNAVAILABLE — month has not begun\n\n")
+cat("Jan–Mar 2025 StaffHours : AVAILABLE — budgeted 2 months in advance\n")
+cat("Jan–Mar 2025 Outreach   : AVAILABLE — set 6 weeks in advance\n")
+cat("Jan–Mar 2025 HolidayWeek: AVAILABLE — determined by the calendar\n\n")
+cat("CONCLUSION: M2 and M3 require future FluIndex values → CANNOT be deployed.\n")
+cat("            M1 requires only StaffHours, Outreach, HolidayWeek → CAN be deployed.\n")
+
+# Q7 — Coefficient Table & Interpretation (6 pts)
+
+
+# Extract coefficients from the deployed model (M1)
+tidy_m1 <- tidy(fit_dr |> select(M1))
+print(tidy_m1)
+
+knitr::kable(
+  tidy_m1 |> select(term, estimate, std.error, statistic, p.value) |>
+    mutate(across(where(is.numeric), ~ round(., 4))),
+  caption = "Table Q7: Tidy coefficient table for deployed model M1"
+)
+
+
+# Q8 — Residual Diagnostics & Ljung-Box Test (4 pts)
+
+
+# Residual diagnostics for deployed model M1
+fit_dr |>
+  select(M1) |>
+  gg_tsresiduals() +
+  labs(title = "M1 Residual Diagnostics (Deployed Model)")
+
+# Ljung-Box test at lag 12 for M1
+lb_result <- augment(fit_dr |> select(M1)) |>
+  features(.innov, ljung_box, lag = 12)
+
+print(lb_result)
+lb_pval <- lb_result$lb_pvalue
+cat("\nLjung-Box p-value for M1:", round(lb_pval, 4), "\n")
+
+
+
+
+# Q9 — Five-Model Comparison (3 pts)
+
+# ── Step 6: Fit all five benchmark and candidate models on train ─────────────
+fit_all <- train |>
+  model(
+    MEAN   = MEAN(Visits),
+    SNAIVE = SNAIVE(Visits),
+    TSLM   = TSLM(Visits ~ trend() + season()),
+    ARIMA  = ARIMA(Visits),
+    DR_M1  = ARIMA(Visits ~ trend() + season() + StaffHours + Outreach + HolidayWeek)
+  )
+
+# Forecast all five models over the holdout period
+fc_all <- fit_all |> forecast(new_data = holdout)
+
+# Accuracy table sorted ascending by MASE
+acc_all <- accuracy(fc_all, meridian) |>
+  select(.model, ME, RMSE, MAE, MASE) |>
+  arrange(MASE)
+
+knitr::kable(
+  acc_all |> mutate(across(where(is.numeric), ~ round(., 4))),
+  caption = "Table Q9: Holdout accuracy for all five models, sorted by MASE (ascending)"
+)
+
+
+rmse_snaive <- acc_all |> filter(.model == "SNAIVE") |> pull(RMSE)
+rmse_dr     <- acc_all |> filter(.model == "DR_M1")  |> pull(RMSE)
+pct_improve <- (rmse_snaive - rmse_dr) / rmse_snaive * 100
+
+cat("SNAIVE RMSE  :", round(rmse_snaive, 4), "\n")
+cat("DR_M1  RMSE  :", round(rmse_dr,     4), "\n")
+cat("% Improvement: (", round(rmse_snaive,4), "-", round(rmse_dr,4), ") /",
+    round(rmse_snaive,4), "× 100 =", round(pct_improve, 1), "%\n")
+
+
+
+
+
+# Q10 — Mean Error (ME) Direction (3 pts)
+
+me_dr <- acc_all |> filter(.model == "DR_M1") |> pull(ME)
+cat("ME for DR_M1:", round(me_dr, 4), "\n")
+
+
+# Q11 — Overlay Plot: Actuals vs SNAIVE vs DR_M1 (5 pts)
+
+
+# Filter forecasts for the two models of interest
+fc_plot <- fc_all |>
+  filter(.model %in% c("SNAIVE", "DR_M1"))
+
+# Build overlay plot
+autoplot(fc_plot, holdout, level = NULL) +
+  autolayer(holdout, Visits, colour = "black", linewidth = 1.2) +
+  scale_colour_manual(
+    values = c("SNAIVE" = "#FF7F0E", "DR_M1" = "#1F77B4"),
+    labels = c("SNAIVE" = "Seasonal Naïve", "DR_M1" = "Deployed DR (M1)")
+  ) +
+  labs(
+    title    = "MeridianCare 2024: Actual Visits vs SNAIVE and Deployed Model (M1)",
+    subtitle = "Black line = actual; coloured lines = point forecasts",
+    x        = "Month",
+    y        = "Visits (thousands)",
+    colour   = "Model"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        plot.title = element_text(face = "bold"))
+
+
+# Q12 — Bug Identification in Junior Analyst Code (10 pts)
+
+
+# ── JUNIOR ANALYST'S FLAWED CODE (reproduced verbatim for reference) ─────────
+
+# ── Q12: Junior Analyst Flawed Code — Corrected Version ─────────────────────
+
+library(fpp3)
+
+# BUG 1 FIX: must use my() to parse "Jan-15" format before yearmonth()
+mc <- read.csv("MeridianCare_Visits.csv") |>
+  mutate(Month = yearmonth(my(Month))) |>   # FIXED: was yearmonth(Month)
+  as_tsibble(index = Month)
+
+train <- mc |> filter(Month < yearmonth("2024 Jan"))
+test  <- mc |> filter(Month >= yearmonth("2024 Jan"))
+
+# BUG 2 FIX: remove lag(FluIndex) from inside ARIMA formula.
+# Pre-compute the lag in the tsibble instead, then use it as a plain column.
+train <- train |>
+  mutate(FluIndex_lag1 = lag(FluIndex, 1))
+
+fit <- train |>
+  model(DR = ARIMA(Visits ~ Outreach + StaffHours + FluIndex_lag1))
+
+report(fit)
+
+# BUG 3a FIX: use .innov not .resid, and set dof to number of estimated params
+augment(fit) |>
+  features(.innov, ljung_box, lag = 12)
+
+# BUG 3b FIX: pass future_x via new_data = , not forecast(h = 12)
+future_x <- new_data(train, 12) |>
+  mutate(
+    Outreach      = mean(train$Outreach,    na.rm = TRUE),
+    StaffHours    = mean(train$StaffHours,  na.rm = TRUE),
+    FluIndex_lag1 = mean(train$FluIndex,    na.rm = TRUE)  # approximation
+  )
+
+# BUG 4 FIX: was forecast(h = 12) which ignores future_x entirely
+fc <- fit |> forecast(new_data = future_x)
+
+accuracy(fc, mc)
+
+## Bug 1 — Incorrect Date Parsing
+
+
+mutate(Month = yearmonth(Month))
+
+##Corrected version:
+
+mutate(Month = yearmonth(my(Month)))   # lubridate::my() parses "Jan-15" → 2015 Jan
+
+
+## Bug 2 — Use of `lag()` Inside ARIMA `xreg`
+
+
+model(DR = ARIMA(Visits ~ Outreach + StaffHours + lag(FluIndex)))
+
+# Pre-compute the lagged regressor BEFORE modelling
+train <- train |> mutate(FluIndex_lag1 = lag(FluIndex, 1))
+
+# Then use the pre-lagged column, and supply correctly shifted future values in new_data
+fit <- train |>
+  model(DR = ARIMA(Visits ~ Outreach + StaffHours + FluIndex_lag1))
+
+# Supply future data manually with the correct lag
+future_x <- new_data(train, 12) |>
+  mutate(Outreach       = mean(train$Outreach, na.rm = TRUE),
+         StaffHours     = mean(train$StaffHours, na.rm = TRUE),
+         FluIndex_lag1  = <actual lagged FluIndex values for the forecast period>)
+
+fc <- fit |> forecast(new_data = future_x)
+
+## Bug 3 — `forecast(h = 12)` Used Instead of `forecast(new_data = ...)` for a Model with External Regressors
+
+
+future_x <- new_data(train, 12) |>
+  mutate(Outreach = mean(train$Outreach),
+         StaffHours = mean(train$StaffHours))
+
+fc <- fit |> forecast(h = 12)
+# Step 1: Populate future_x with ALL regressors the model needs
+future_x <- new_data(train, 12) |>
+  mutate(
+    Outreach    = <actual planned outreach values for the 12 forecast months>,
+    StaffHours  = <actual budgeted staff-hours for the 12 forecast months>,
+    FluIndex    = <known or projected FluIndex, if available>
+  )
+
+# Step 2: Pass future_x explicitly to forecast()
+fc <- fit |> forecast(new_data = future_x)
+
+# Q13 — New-Market Forecasting Recommendation (10 pts)
+
+
+
